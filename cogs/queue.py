@@ -195,6 +195,28 @@ NOTIFY_ALIASES.update(
 def render_notify(template, values, guild):
     return templating.render(template, values, NOTIFY_ALIASES, guild)
 
+def valid_link(url):
+    return bool(url) and url.strip().lower().startswith(
+        ("http://", "https://", "discord://")
+    )
+
+def add_link(view, label, emoji, url):
+    if not url:
+        return
+    label = (label or "").strip() or None
+    partial = emojiutils.to_partial(emoji)
+    if label is None and partial is None:
+        return
+    view.add_item(discord.ui.Button(url=url, label=label, emoji=partial))
+
+def notify_view(settings, jump_url):
+    view = discord.ui.View(timeout=None)
+    add_link(view, settings.get("notify_jump_label", "view order"),
+             settings.get("notify_jump_emoji"), jump_url)
+    add_link(view, settings.get("notify_link_label"),
+             settings.get("notify_link_emoji"), settings.get("notify_link_url"))
+    return view if view.children else None
+
 def stamp_values(guild, order):
     stamp = int(order.get("created_at") or 0)
 
@@ -462,6 +484,89 @@ class NotifyModal(discord.ui.Modal, title="Queued Message"):
     async def on_submit(self, interaction):
         await interaction.response.defer()
         self.builder.settings["notify"] = self.f_text.value.strip()
+        save_config()
+        await self.builder.refresh()
+
+class NotifyButtonsModal(discord.ui.Modal, title="Queued Message Buttons"):
+    def __init__(self, builder):
+        super().__init__()
+        self.builder = builder
+        s = builder.settings
+        self.f_jump_label = discord.ui.TextInput(
+            label="Jump button text",
+            default=s.get("notify_jump_label", "view order"),
+            placeholder="links to the queue post. blank hides it",
+            max_length=80,
+            required=False,
+        )
+        self.f_jump_emoji = discord.ui.TextInput(
+            label="Jump button icon",
+            default=s.get("notify_jump_emoji") or "",
+            placeholder="an emoji, or blank",
+            max_length=64,
+            required=False,
+        )
+        self.f_link_label = discord.ui.TextInput(
+            label="Extra button text",
+            default=s.get("notify_link_label") or "",
+            placeholder="e.g. vouch",
+            max_length=80,
+            required=False,
+        )
+        self.f_link_url = discord.ui.TextInput(
+            label="Extra button link",
+            default=s.get("notify_link_url") or "",
+            placeholder="https://... blank hides it",
+            max_length=400,
+            required=False,
+        )
+        self.f_link_emoji = discord.ui.TextInput(
+            label="Extra button icon",
+            default=s.get("notify_link_emoji") or "",
+            placeholder="an emoji, or blank",
+            max_length=64,
+            required=False,
+        )
+        for item in (
+            self.f_jump_label,
+            self.f_jump_emoji,
+            self.f_link_label,
+            self.f_link_url,
+            self.f_link_emoji,
+        ):
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        jump_emoji, p1 = emojiutils.parse(self.f_jump_emoji.value, interaction.guild)
+        if p1:
+            await interaction.response.send_message(
+                embed=embeds.error(p1, title="Bad icon"), ephemeral=True
+            )
+            return
+        link_emoji, p2 = emojiutils.parse(self.f_link_emoji.value, interaction.guild)
+        if p2:
+            await interaction.response.send_message(
+                embed=embeds.error(p2, title="Bad icon"), ephemeral=True
+            )
+            return
+
+        link_url = self.f_link_url.value.strip()
+        if link_url and not valid_link(link_url):
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "the extra button link has to start with http:// or https://."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        s = self.builder.settings
+        s["notify_jump_label"] = self.f_jump_label.value.strip()
+        s["notify_jump_emoji"] = jump_emoji
+        s["notify_link_label"] = self.f_link_label.value.strip()
+        s["notify_link_url"] = link_url
+        s["notify_link_emoji"] = link_emoji
         save_config()
         await self.builder.refresh()
 
@@ -757,6 +862,8 @@ class SetupView(discord.ui.View):
             f"**Starts at** - {statuses_of(settings)[0]['label']}",
             f"**Menu says** - {settings.get('placeholder') or DEFAULT_PLACEHOLDER}",
             f"**Queued msg** - {(settings.get('notify') or 'off')[:80]}",
+            f"**Queued buttons** - {(settings.get('notify_jump_label', 'view order') or 'none')}"
+            + (f" · {settings.get('notify_link_label') or 'link'}" if settings.get('notify_link_url') else ""),
             "",
             "**Statuses**",
         ]
@@ -823,6 +930,10 @@ class SetupView(discord.ui.View):
     @discord.ui.button(label="queued msg", style=discord.ButtonStyle.secondary, row=0)
     async def queued_msg(self, interaction, button):
         await interaction.response.send_modal(NotifyModal(self))
+
+    @discord.ui.button(label="queued buttons", style=discord.ButtonStyle.secondary, row=0)
+    async def queued_buttons(self, interaction, button):
+        await interaction.response.send_modal(NotifyButtonsModal(self))
 
     @discord.ui.button(label="fields", style=discord.ButtonStyle.secondary, row=1)
     async def fields(self, interaction, button):
@@ -956,6 +1067,7 @@ class ConfirmView(discord.ui.View):
             try:
                 await self.ctx.channel.send(
                     content=notify[:2000],
+                    view=notify_view(self.settings, sent.jump_url),
                     allowed_mentions=discord.AllowedMentions(
                         everyone=False, roles=False, users=ping
                     ),
