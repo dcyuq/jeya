@@ -255,6 +255,30 @@ def can_update(member, order):
         or member.guild_permissions.manage_messages
     )
 
+def channel_name_for(status_text, opener, ticket):
+    raw = f"{status_text}-{opener}-{ticket}"
+    name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return name[:100] or "ticket"
+
+async def rename_source(guild, settings, order):
+    channel_id = order.get("source_channel_id")
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+    name = channel_name_for(
+        status_label(settings, order["status"]),
+        order.get("opener_name") or "user",
+        order["ticket"],
+    )
+    if channel.name == name:
+        return
+    try:
+        await channel.edit(name=name, reason="queue status")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
 class StatusSelect(discord.ui.Select):
 
     def __init__(self, settings, current=None):
@@ -321,6 +345,8 @@ class StatusSelect(discord.ui.Select):
             embed=None,
             view=QueueView(settings, chosen),
         )
+
+        await rename_source(interaction.guild, settings, order)
 
 class QueueView(discord.ui.View):
 
@@ -880,6 +906,19 @@ class ConfirmView(discord.ui.View):
         orders[sent.id] = self.order
         save_orders()
 
+        await rename_source(interaction.guild, self.settings, self.order)
+
+        try:
+            await self.ctx.channel.send(
+                embed=embeds.notice(
+                    f"order queued in {channel.mention}. {sent.jump_url}",
+                    title="Order queued",
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            pass
+
         for item in self.children:
             item.disabled = True
 
@@ -986,6 +1025,8 @@ class Queue(commands.Cog):
             "created_at": int(time.time()),
             "status": initial_status(settings),
             "updated_by": None,
+            "source_channel_id": ctx.channel.id,
+            "opener_name": user.display_name,
         }
 
         view = ConfirmView(ctx, settings, order)
@@ -1064,6 +1105,8 @@ class Queue(commands.Cog):
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
+        await rename_source(ctx.guild, settings, order)
 
         await embeds.send(
             ctx,
