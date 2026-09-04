@@ -43,6 +43,7 @@ DEFAULT_TEMPLATE = (
 
 DEFAULT_PLACEHOLDER = "update order status"
 DEFAULT_OPTION_TEXT = "change order status"
+DEFAULT_NOTIFY = "order queued in {channel}"
 
 DEFAULT_STATUSES = [
     {"key": "noted", "label": "noted", "emoji": None,
@@ -122,6 +123,7 @@ def ensure_config(guild_id):
         config[key] = {
             "channel_id": None,
             "template": DEFAULT_TEMPLATE,
+            "notify": DEFAULT_NOTIFY,
             "ping": True,
             "placeholder": DEFAULT_PLACEHOLDER,
             "statuses": [dict(s) for s in DEFAULT_STATUSES],
@@ -129,6 +131,7 @@ def ensure_config(guild_id):
 
     settings = config[key]
     settings.setdefault("template", DEFAULT_TEMPLATE)
+    settings.setdefault("notify", DEFAULT_NOTIFY)
     settings.setdefault("ping", True)
     settings.setdefault("placeholder", DEFAULT_PLACEHOLDER)
     settings.setdefault("channel_id", None)
@@ -140,6 +143,7 @@ def settings_for(guild_id):
     return get_config(guild_id) or {
         "channel_id": None,
         "template": DEFAULT_TEMPLATE,
+        "notify": DEFAULT_NOTIFY,
         "ping": True,
         "placeholder": DEFAULT_PLACEHOLDER,
         "statuses": [dict(s) for s in DEFAULT_STATUSES],
@@ -181,6 +185,15 @@ def render(template, values, guild):
 
 def unknown_placeholders(template):
     return templating.unknown(template, ALIASES)
+
+NOTIFY_ALIASES = dict(ALIASES)
+NOTIFY_ALIASES.update(
+    {"channel": "channel", "queue": "channel",
+     "link": "link", "post": "link", "jump": "link"}
+)
+
+def render_notify(template, values, guild):
+    return templating.render(template, values, NOTIFY_ALIASES, guild)
 
 def stamp_values(guild, order):
     stamp = int(order.get("created_at") or 0)
@@ -270,7 +283,7 @@ async def rename_source(guild, settings, order):
     name = channel_name_for(
         status_label(settings, order["status"]),
         order.get("opener_name") or "user",
-        order["ticket"],
+        order.get("ticket_base") or order["ticket"],
     )
     if channel.name == name:
         return
@@ -431,6 +444,26 @@ class TemplateModal(discord.ui.Modal, title="Queue Format"):
                 ),
                 ephemeral=True,
             )
+
+class NotifyModal(discord.ui.Modal, title="Queued Message"):
+    def __init__(self, builder):
+        super().__init__()
+        self.builder = builder
+        self.f_text = discord.ui.TextInput(
+            label="Posted when an order is queued",
+            default=(builder.settings.get("notify") or "")[:2000],
+            placeholder="blank turns it off. {channel} {link} and :emoji: work",
+            style=discord.TextStyle.paragraph,
+            max_length=2000,
+            required=False,
+        )
+        self.add_item(self.f_text)
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer()
+        self.builder.settings["notify"] = self.f_text.value.strip()
+        save_config()
+        await self.builder.refresh()
 
 class StatusModal(discord.ui.Modal, title="Status"):
     def __init__(self, builder, existing=None):
@@ -723,6 +756,7 @@ class SetupView(discord.ui.View):
             f"**Pings the customer** - {'yes' if settings['ping'] else 'no'}",
             f"**Starts at** - {statuses_of(settings)[0]['label']}",
             f"**Menu says** - {settings.get('placeholder') or DEFAULT_PLACEHOLDER}",
+            f"**Queued msg** - {(settings.get('notify') or 'off')[:80]}",
             "",
             "**Statuses**",
         ]
@@ -786,6 +820,10 @@ class SetupView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(label="queued msg", style=discord.ButtonStyle.secondary, row=0)
+    async def queued_msg(self, interaction, button):
+        await interaction.response.send_modal(NotifyModal(self))
+
     @discord.ui.button(label="fields", style=discord.ButtonStyle.secondary, row=1)
     async def fields(self, interaction, button):
         await interaction.response.send_message(
@@ -794,7 +832,8 @@ class SetupView(discord.ui.View):
                 "in:\n\n"
                 + "\n".join(f"`{{{f}}}`" for f in FIELDS)
                 + "\n\ntype `:name:` for a server emoji and it gets resolved "
-                "when the post goes out.",
+                "when the post goes out.\n\nthe queued message can also use "
+                "`{channel}` and `{link}` for the queue post.",
                 title="Format fields",
             ),
             ephemeral=True,
@@ -908,16 +947,21 @@ class ConfirmView(discord.ui.View):
 
         await rename_source(interaction.guild, self.settings, self.order)
 
-        try:
-            await self.ctx.channel.send(
-                embed=embeds.notice(
-                    f"order queued in {channel.mention}. {sent.jump_url}",
-                    title="Order queued",
-                ),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            pass
+        values = order_values(interaction.guild, self.settings, self.order)
+        values.update({"channel": channel.mention, "link": sent.jump_url})
+        notify = render_notify(
+            self.settings.get("notify", DEFAULT_NOTIFY), values, interaction.guild
+        ).strip()
+        if notify:
+            try:
+                await self.ctx.channel.send(
+                    content=notify[:2000],
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, users=ping
+                    ),
+                )
+            except discord.HTTPException:
+                pass
 
         for item in self.children:
             item.disabled = True
@@ -1027,6 +1071,7 @@ class Queue(commands.Cog):
             "updated_by": None,
             "source_channel_id": ctx.channel.id,
             "opener_name": user.display_name,
+            "ticket_base": ctx.channel.name,
         }
 
         view = ConfirmView(ctx, settings, order)
