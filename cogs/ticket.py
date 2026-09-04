@@ -1468,12 +1468,35 @@ class StyleSelect(discord.ui.Select):
         )
         await self.builder.refresh()
 
+class ButtonCategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, builder, button_data):
+        self.builder = builder
+        self.button_data = button_data
+        super().__init__(
+            channel_types=[discord.ChannelType.category],
+            placeholder="Category for this button (blank = default)",
+            min_values=0,
+            max_values=1,
+            row=1,
+        )
+
+    async def callback(self, interaction):
+        self.button_data["category_id"] = self.values[0].id if self.values else None
+        save_config()
+
+        refreshed = ButtonManageView(self.builder, self.button_data)
+        await interaction.response.edit_message(
+            embed=refreshed.summary(), view=refreshed
+        )
+        await self.builder.refresh()
+
 class ButtonManageView(discord.ui.View):
     def __init__(self, builder, button_data):
         super().__init__(timeout=300)
         self.builder = builder
         self.button_data = button_data
         self.add_item(StyleSelect(builder, button_data))
+        self.add_item(ButtonCategorySelect(builder, button_data))
 
     async def interaction_check(self, interaction):
         return interaction.user.id == self.builder.ctx.author.id
@@ -1490,29 +1513,34 @@ class ButtonManageView(discord.ui.View):
             mode = "Opens a ticket immediately"
             listed = "No questions set."
 
+        override = self.button_data.get("category_id")
+        category = self.builder.ctx.guild.get_channel(override) if override else None
+        category_text = category.name if category else "default category"
+
         return discord.Embed(
             title=f"Button: {self.button_data['label']}",
             description=(
                 f"**Icon** - {icon_text(self.button_data)}\n"
                 f"**Colour** - {style_label(self.button_data.get('style'))}\n"
+                f"**Category** - {category_text}\n"
                 f"**Behaviour** - {mode}\n\n"
                 f"{listed}"
             ),
         )
 
-    @discord.ui.button(label="Edit Details", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Edit Details", style=discord.ButtonStyle.secondary, row=2)
     async def edit_details(self, interaction, button):
         await interaction.response.send_modal(
             ButtonEditModal(self.builder.settings, self.builder, self.button_data)
         )
 
-    @discord.ui.button(label="Set Questions", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Set Questions", style=discord.ButtonStyle.secondary, row=2)
     async def set_questions(self, interaction, button):
         await interaction.response.send_modal(
             QuestionsModal(self.builder, self.button_data)
         )
 
-    @discord.ui.button(label="Open Instantly", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Open Instantly", style=discord.ButtonStyle.secondary, row=2)
     async def clear_questions(self, interaction, button):
         await interaction.response.defer()
         self.button_data["questions"] = []
@@ -1523,7 +1551,7 @@ class ButtonManageView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Delete Button", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Delete Button", style=discord.ButtonStyle.secondary, row=3)
     async def delete_button(self, interaction, button):
         await interaction.response.defer()
         if self.button_data in self.builder.settings["buttons"]:
@@ -1645,7 +1673,10 @@ class BuilderView(discord.ui.View):
                 colour = style_label(entry.get("style"))
                 icon = entry.get("emoji")
                 shown = f"{icon} {entry['label']}" if icon else entry["label"]
-                lines.append(f"- {shown} ({colour}, {mode})")
+                override = entry.get("category_id")
+                cat = guild.get_channel(override) if override else None
+                where = cat.name if cat else "default"
+                lines.append(f"- {shown} ({colour}, {mode}, {where})")
         else:
             lines.append("")
             lines.append("**Buttons** - none yet, add one before publishing")
