@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import re
@@ -322,6 +323,13 @@ async def rename_source(guild, settings, order):
     except (discord.Forbidden, discord.HTTPException):
         pass
 
+_rename_tasks = set()
+
+def schedule_rename(guild, settings, order):
+    task = asyncio.create_task(rename_source(guild, settings, order))
+    _rename_tasks.add(task)
+    task.add_done_callback(_rename_tasks.discard)
+
 def completed_view(settings):
     view = discord.ui.View(timeout=None)
     add_link(view, settings.get("vouch_label", "vouch"),
@@ -424,8 +432,8 @@ class StatusSelect(discord.ui.Select):
             view=QueueView(settings, chosen),
         )
 
-        await rename_source(interaction.guild, settings, order)
         await send_completed(interaction.guild, settings, order)
+        schedule_rename(interaction.guild, settings, order)
 
 class QueueView(discord.ui.View):
 
@@ -1199,7 +1207,7 @@ class ConfirmView(discord.ui.View):
         orders[sent.id] = self.order
         save_orders()
 
-        await rename_source(interaction.guild, self.settings, self.order)
+        schedule_rename(interaction.guild, self.settings, self.order)
 
         values = order_values(interaction.guild, self.settings, self.order)
         values.update({"channel": channel.mention, "link": sent.jump_url})
@@ -1405,8 +1413,8 @@ class Queue(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
-        await rename_source(ctx.guild, settings, order)
         await send_completed(ctx.guild, settings, order)
+        schedule_rename(ctx.guild, settings, order)
 
         await embeds.send(
             ctx,
