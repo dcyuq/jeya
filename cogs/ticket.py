@@ -29,6 +29,7 @@ CATEGORY_LIMIT = 50
 MAX_BUTTONS = 10
 MAX_QUESTIONS = 5
 MAX_STAFF_ROLES = 10
+MAX_OPEN_PER_USER = 5
 
 STYLES = {
     "primary": discord.ButtonStyle.secondary,
@@ -388,11 +389,12 @@ def find_button(settings, key):
             return entry
     return None
 
-def open_ticket_for(guild_id, user_id):
-    for channel_id, data in tickets.items():
-        if data["guild_id"] == guild_id and data["opener_id"] == user_id:
-            return channel_id
-    return None
+def open_tickets_for(guild_id, user_id):
+    return [
+        channel_id
+        for channel_id, data in tickets.items()
+        if data["guild_id"] == guild_id and data["opener_id"] == user_id
+    ]
 
 def duration_text(seconds):
     seconds = int(seconds)
@@ -473,18 +475,20 @@ async def create_ticket(interaction, button_data, answers):
     guild = interaction.guild
     settings = get_config(guild.id)
 
-    existing = open_ticket_for(guild.id, interaction.user.id)
-    if existing is not None:
-        channel = guild.get_channel(existing)
-        if channel is not None:
-            await interaction.followup.send(
-                embed=embeds.error(f"you already have an open ticket: {channel.mention}"),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        tickets.pop(existing, None)
+    owned = open_tickets_for(guild.id, interaction.user.id)
+    live = [c for c in owned if guild.get_channel(c) is not None]
+    if len(live) != len(owned):
+        for stale in owned:
+            if stale not in live:
+                tickets.pop(stale, None)
         save_tickets()
+    if len(live) >= MAX_OPEN_PER_USER:
+        await interaction.followup.send(
+            embed=embeds.error(f"you already have {MAX_OPEN_PER_USER} open tickets. close one before opening another."),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
 
     category_id = button_data.get("category_id") or settings["category_id"]
     category = guild.get_channel(category_id)
@@ -561,7 +565,6 @@ async def create_ticket(interaction, button_data, answers):
     embed = discord.Embed(
         title=f"Ticket {number:04d} - {button_data['label']}",
         description=button_data.get("welcome") or DEFAULT_BUTTON["welcome"],
-        color=settings["panel"]["color"],
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(name="Opened By", value=interaction.user.mention, inline=False)
