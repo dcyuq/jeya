@@ -562,20 +562,18 @@ async def create_ticket(interaction, button_data, answers):
     }
     save_tickets()
 
-    embed = discord.Embed(
-        title=f"Ticket {number:04d} - {button_data['label']}",
-        description=button_data.get("welcome") or DEFAULT_BUTTON["welcome"],
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="Opened By", value=interaction.user.mention, inline=False)
+    welcome = button_data.get("welcome") or DEFAULT_BUTTON["welcome"]
+    parts = [f"**Ticket {number:04d} - {button_data['label']}**", "", welcome]
     for question, answer in answers:
-        embed.add_field(name=question[:256], value=(answer or "-")[:1024], inline=False)
+        parts.append("")
+        parts.append(f"**{question[:256]}**")
+        parts.append((answer or "-")[:1024])
+    body = "\n".join(parts)
 
     mentions = " ".join(r.mention for r in roles)
+    ping = f"{interaction.user.mention} {mentions}".strip()
     await channel.send(
-        content=f"{interaction.user.mention} {mentions}".strip(),
-        embed=embed,
-        view=TicketControlView(),
+        view=TicketControlView(ping, body),
         allowed_mentions=discord.AllowedMentions(users=True, roles=roles or False),
     )
 
@@ -1020,10 +1018,7 @@ class DropdownPanelView(discord.ui.View):
         self.add_item(TicketSelect(guild_id, buttons, placeholder))
 
 
-class TicketControlView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
+class TicketControls(discord.ui.ActionRow):
     @discord.ui.button(
         label="Claim", style=discord.ButtonStyle.secondary, custom_id="ticket:claim"
     )
@@ -1098,6 +1093,15 @@ class TicketControlView(discord.ui.View):
         await interaction.response.send_modal(
             CloseReasonModal(data, interaction.channel)
         )
+
+class TicketControlView(discord.ui.LayoutView):
+    def __init__(self, ping=None, body=None):
+        super().__init__(timeout=None)
+        if ping:
+            self.add_item(discord.ui.TextDisplay(ping))
+        if body:
+            self.add_item(discord.ui.Container(discord.ui.TextDisplay(body)))
+        self.add_item(TicketControls())
 
 class EmbedEditModal(discord.ui.Modal, title="Panel Appearance"):
     def __init__(self, settings, builder):
