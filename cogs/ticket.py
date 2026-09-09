@@ -117,6 +117,7 @@ DEFAULT_BUTTON = {
     "style": "primary",
     "emoji": None,
     "category_id": None,
+    "channel_name": None,
     "welcome": "Describe your issue and someone will be with you shortly.",
     "questions": [],
 }
@@ -308,6 +309,17 @@ def icon_partial(raw):
 
 def icon_text(button_data):
     return button_data.get("emoji") or "none"
+
+def button_text(button_data):
+    return button_data.get("label") or button_data.get("channel_name") or "Ticket"
+
+def channel_prefix(button_data):
+    return button_data.get("channel_name") or button_data.get("label") or "ticket"
+
+def channel_slug(button_data, user, number):
+    raw = f"{channel_prefix(button_data)}-{user.name}"
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip("-")[:100]
+    return slug or f"ticket-{number:04d}"
 
 def save_config():
     _config_store.save(config)
@@ -534,7 +546,7 @@ async def create_ticket(interaction, button_data, answers):
 
     try:
         channel = await guild.create_text_channel(
-            name=f"ticket-{number:04d}",
+            name=channel_slug(button_data, interaction.user, number),
             category=category,
             overwrites=overwrites,
             reason=f"Ticket opened by {interaction.user}",
@@ -557,13 +569,13 @@ async def create_ticket(interaction, button_data, answers):
         "number": number,
         "opened_at": time.time(),
         "claimed_by": None,
-        "kind": button_data["label"],
+        "kind": button_text(button_data),
         "answers": answers,
     }
     save_tickets()
 
     welcome = button_data.get("welcome") or DEFAULT_BUTTON["welcome"]
-    parts = [f"**Ticket {number:04d} - {button_data['label']}**", "", welcome]
+    parts = [f"**Ticket {number:04d} - {button_text(button_data)}**", "", welcome]
     for question, answer in answers:
         parts.append("")
         parts.append(f"**{question[:256]}**")
@@ -589,7 +601,7 @@ async def create_ticket(interaction, button_data, answers):
     )
     log_embed.add_field(name="Ticket ID", value=str(number), inline=True)
     log_embed.add_field(name="Opened By", value=interaction.user.mention, inline=True)
-    log_embed.add_field(name="Type", value=button_data["label"], inline=True)
+    log_embed.add_field(name="Type", value=button_text(button_data), inline=True)
     log_embed.add_field(name="Channel", value=channel.mention, inline=False)
     for question, answer in answers:
         log_embed.add_field(
@@ -904,7 +916,7 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
 
 class TicketQuestionModal(discord.ui.Modal):
     def __init__(self, button_data):
-        super().__init__(title=button_data["label"][:45])
+        super().__init__(title=button_text(button_data)[:45])
         self.button_data = button_data
         self.inputs = []
 
@@ -925,8 +937,9 @@ class TicketQuestionModal(discord.ui.Modal):
 
 class TicketOpenButton(discord.ui.Button):
     def __init__(self, guild_id, button_data):
+        label = (button_data.get("label") or "").strip()[:80]
         super().__init__(
-            label=button_data["label"][:80],
+            label=label or None,
             emoji=icon_partial(button_data.get("emoji")),
             style=STYLES[canonical_style(button_data.get("style"))],
             custom_id=f"ticket:open:{guild_id}:{button_data['key']}",
@@ -974,7 +987,7 @@ class TicketSelect(discord.ui.Select):
     def __init__(self, guild_id, buttons, placeholder):
         options = [
             discord.SelectOption(
-                label=button_data["label"][:100],
+                label=button_text(button_data)[:100],
                 value=button_data["key"],
                 emoji=icon_partial(button_data.get("emoji")),
             )
@@ -1188,7 +1201,11 @@ class ButtonEditModal(discord.ui.Modal, title="Ticket Button"):
         base = existing or DEFAULT_BUTTON
 
         self.f_label = discord.ui.TextInput(
-            label="Button label", default=base["label"], max_length=80, required=True
+            label="Button label",
+            default=base.get("label") or "",
+            placeholder="Blank for an icon only button",
+            max_length=80,
+            required=False,
         )
         self.f_emoji = discord.ui.TextInput(
             label="Icon",
@@ -1196,6 +1213,13 @@ class ButtonEditModal(discord.ui.Modal, title="Ticket Button"):
             placeholder="😀 or :servername: - blank for none",
             required=False,
             max_length=100,
+        )
+        self.f_channel = discord.ui.TextInput(
+            label="Channel name",
+            default=base.get("channel_name") or "",
+            placeholder="Blank uses the label. Username goes after it",
+            required=False,
+            max_length=60,
         )
         self.f_welcome = discord.ui.TextInput(
             label="Opening message",
@@ -1212,7 +1236,13 @@ class ButtonEditModal(discord.ui.Modal, title="Ticket Button"):
             max_length=25,
         )
 
-        for item in (self.f_label, self.f_emoji, self.f_welcome, self.f_category):
+        for item in (
+            self.f_label,
+            self.f_emoji,
+            self.f_channel,
+            self.f_welcome,
+            self.f_category,
+        ):
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -1241,6 +1271,22 @@ class ButtonEditModal(discord.ui.Modal, title="Ticket Button"):
             )
             return
 
+        label = self.f_label.value.strip()
+        channel_name = self.f_channel.value.strip() or None
+
+        if not label and not emoji_value:
+            await interaction.response.send_message(
+                embed=embeds.error("give the button a label, an icon, or both."), ephemeral=True
+            )
+            return
+
+        if not label and not channel_name:
+            await interaction.response.send_message(
+                embed=embeds.error("an icon only button needs a channel name, since there is no label to build one from."),
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer()
 
         welcome = resolve_text(
@@ -1251,18 +1297,20 @@ class ButtonEditModal(discord.ui.Modal, title="Ticket Button"):
             self.settings["buttons"].append(
                 {
                     "key": uuid.uuid4().hex[:8],
-                    "label": self.f_label.value,
+                    "label": label or None,
                     "style": "primary",
                     "emoji": emoji_value,
                     "category_id": category_id,
+                    "channel_name": channel_name,
                     "welcome": welcome,
                     "questions": [],
                 }
             )
         else:
-            self.existing["label"] = self.f_label.value
+            self.existing["label"] = label or None
             self.existing["emoji"] = emoji_value
             self.existing["category_id"] = category_id
+            self.existing["channel_name"] = channel_name
             self.existing["welcome"] = welcome
 
         save_config()
@@ -1525,11 +1573,13 @@ class ButtonManageView(discord.ui.View):
         category_text = category.name if category else "default category"
 
         return discord.Embed(
-            title=f"Button: {self.button_data['label']}",
+            title=f"Button: {button_text(self.button_data)}",
             description=(
+                f"**Label** - {self.button_data.get('label') or 'icon only'}\n"
                 f"**Icon** - {icon_text(self.button_data)}\n"
                 f"**Colour** - {style_label(self.button_data.get('style'))}\n"
                 f"**Category** - {category_text}\n"
+                f"**Channel** - {channel_prefix(self.button_data)}-username\n"
                 f"**Behaviour** - {mode}\n\n"
                 f"{listed}"
             ),
@@ -1554,7 +1604,7 @@ class ButtonManageView(discord.ui.View):
         save_config()
         await self.builder.refresh()
         await interaction.followup.send(
-            embed=embeds.notice(f"`{self.button_data['label']}` now opens a ticket immediately."),
+            embed=embeds.notice(f"`{button_text(self.button_data)}` now opens a ticket immediately."),
             ephemeral=True,
         )
 
@@ -1566,7 +1616,7 @@ class ButtonManageView(discord.ui.View):
             save_config()
         await self.builder.refresh()
         await interaction.followup.send(
-            embed=embeds.notice(f"removed `{self.button_data['label']}`."), ephemeral=True
+            embed=embeds.notice(f"removed `{button_text(self.button_data)}`."), ephemeral=True
         )
         self.stop()
 
@@ -1575,7 +1625,7 @@ class ButtonPickSelect(discord.ui.Select):
         self.builder = builder
         options = [
             discord.SelectOption(
-                label=b["label"][:100],
+                label=button_text(b)[:100],
                 value=b["key"],
                 emoji=icon_partial(b.get("emoji")),
                 description=(
@@ -1679,11 +1729,19 @@ class BuilderView(discord.ui.View):
                 mode = f"asks {count}" if count else "instant"
                 colour = style_label(entry.get("style"))
                 icon = entry.get("emoji")
-                shown = f"{icon} {entry['label']}" if icon else entry["label"]
+                label = entry.get("label")
+                if icon and label:
+                    shown = f"{icon} {label}"
+                elif icon:
+                    shown = f"{icon} (icon only)"
+                else:
+                    shown = button_text(entry)
                 override = entry.get("category_id")
                 cat = guild.get_channel(override) if override else None
                 where = cat.name if cat else "default"
-                lines.append(f"- {shown} ({colour}, {mode}, {where})")
+                lines.append(
+                    f"- {shown} ({colour}, {mode}, {where}, {channel_prefix(entry)}-username)"
+                )
         else:
             lines.append("")
             lines.append("**Buttons** - none yet, add one before publishing")
