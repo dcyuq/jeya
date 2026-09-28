@@ -556,7 +556,7 @@ async def create_ticket(interaction, button_data, answers):
             embed=embeds.error("i don't have permission to create channels there."), ephemeral=True
         )
         return
-    except discord.HTTPException as exc:
+    except discord.HTTPException:
         await interaction.followup.send(
             embed=embeds.error("discord turned that request down. check the log."),
             ephemeral=True,
@@ -615,11 +615,12 @@ def build_close_embed(guild, entry):
     claimer = guild.get_member(entry.get("claimed_by") or 0)
     opener_text = opener.mention if opener else f"<@{entry['opener_id']}>"
     closer_text = closer.mention if closer else f"<@{entry['closer_id']}>"
+    closed_by_opener = entry["closer_id"] == entry["opener_id"]
 
     lines = [
         f"**ticket #{entry['number']:04d} closed** · {entry.get('kind', 'Ticket')}",
         "",
-        f"opened by {opener_text} · closed by {closer_text}",
+        f"opened by {opener_text} · closed by {closer_text}" + (" (opener)" if closed_by_opener else ""),
         f"open for {duration_text(entry['closed_at'] - entry['opened_at'])} · {entry.get('message_count', 0)} messages",
     ]
     if claimer:
@@ -695,7 +696,9 @@ body{margin:0;background:#1e1e1f;color:#dcdcdc;font:14px/1.5 -apple-system,Segoe
 .who{font-weight:600;color:#fff}
 .when{color:#6f6f6f;font-size:12px}
 .body{margin-top:3px;word-wrap:break-word}
-.body img{max-width:420px;max-height:320px;border-radius:6px;margin-top:6px;display:block}\n.body img.emoji{width:20px;height:20px;display:inline;vertical-align:-4px;margin:0 1px;border-radius:0}\n.body img.sticker{max-width:160px;max-height:160px}
+.body img{max-width:420px;max-height:320px;border-radius:6px;margin-top:6px;display:block}
+.body img.emoji{width:20px;height:20px;display:inline;vertical-align:-4px;margin:0 1px;border-radius:0}
+.body img.sticker{max-width:160px;max-height:160px}
 .body a{color:#8ab4f8}
 .empty{color:#7c7c7c;padding:24px}
 </style>"""
@@ -836,20 +839,28 @@ async def dm_transcript(client, guild, entry, document, transcript_url):
         pass
 
 class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
-    def __init__(self, data, channel):
+    def __init__(self, data, channel, staff):
         super().__init__()
         self.data = data
         self.channel = channel
         self.f_reason = discord.ui.TextInput(
             label="Reason for closing",
-            placeholder="Shown to staff in the log",
+            placeholder="Shown to staff in the log" if staff else "Optional, leave blank if resolved",
             style=discord.TextStyle.paragraph,
             max_length=1000,
-            required=True,
+            required=staff,
         )
         self.add_item(self.f_reason)
 
     async def on_submit(self, interaction):
+        if self.channel.id not in tickets:
+            await interaction.response.send_message(
+                embed=embeds.error("this ticket is already being closed."), ephemeral=True
+            )
+            return
+        tickets.pop(self.channel.id, None)
+        save_tickets()
+
         await interaction.response.send_message(
             embed=embeds.notice("closing this ticket. a transcript is on its way."),
             ephemeral=True,
@@ -867,7 +878,7 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
             "closed_at": time.time(),
             "kind": self.data.get("kind", "Ticket"),
             "answers": self.data.get("answers", []),
-            "reason": self.f_reason.value,
+            "reason": self.f_reason.value.strip() or None,
             "message_count": len(messages),
         }
 
@@ -905,9 +916,6 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
         await dm_transcript(
             interaction.client, interaction.guild, entry, document, transcript_url
         )
-
-        tickets.pop(self.channel.id, None)
-        save_tickets()
 
         try:
             await self.channel.delete(reason=f"Ticket closed by {interaction.user}")
@@ -1094,17 +1102,15 @@ class TicketControls(discord.ui.ActionRow):
             )
             return
 
-        if (
-            not is_staff(interaction.user, settings)
-            and interaction.user.id != data["opener_id"]
-        ):
+        staff = is_staff(interaction.user, settings)
+        if not staff and interaction.user.id != data["opener_id"]:
             await interaction.response.send_message(
                 embed=embeds.error("only staff or the ticket opener can close this."), ephemeral=True
             )
             return
 
         await interaction.response.send_modal(
-            CloseReasonModal(data, interaction.channel)
+            CloseReasonModal(data, interaction.channel, staff)
         )
 
 class TicketControlView(discord.ui.LayoutView):
@@ -1842,7 +1848,7 @@ class BuilderView(discord.ui.View):
                 embed=embeds.error("i can't post in that channel."), ephemeral=True
             )
             return
-        except discord.HTTPException as exc:
+        except discord.HTTPException:
             await interaction.followup.send(
                 embed=embeds.error("discord turned the panel down. check the log."),
                 ephemeral=True,
