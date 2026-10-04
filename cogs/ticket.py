@@ -291,12 +291,17 @@ def missing_names(text, guild, client):
     ]
     return sorted(dict.fromkeys(dead))
 
+CLIENT = None
+
 def icon_partial(raw):
     text = (raw or "").strip()
     if not text:
         return None
 
-    if CUSTOM_TOKEN.fullmatch(text):
+    match = CUSTOM_TOKEN.fullmatch(text)
+    if match:
+        if CLIENT is not None and CLIENT.get_emoji(int(match.group(3))) is None:
+            return None
         try:
             return discord.PartialEmoji.from_str(text)
         except (ValueError, TypeError):
@@ -2030,4 +2035,6 @@ class Tickets(commands.Cog):
         await ctx.send(embed=embed)
 
 async def setup(bot):
+    global CLIENT
+    CLIENT = bot
     await bot.add_cog(Tickets(bot))
