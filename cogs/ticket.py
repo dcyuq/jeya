@@ -1021,6 +1021,7 @@ class TicketSelect(discord.ui.Select):
             await interaction.response.send_message(
                 embed=embeds.error("the ticket system isn't finished being set up."), ephemeral=True
             )
+            await self.reset(interaction, settings)
             return
 
         button_data = find_button(settings, self.values[0])
@@ -1028,14 +1029,30 @@ class TicketSelect(discord.ui.Select):
             await interaction.response.send_message(
                 embed=embeds.error("that option is no longer configured."), ephemeral=True
             )
+            await self.reset(interaction, settings)
             return
 
         if button_data.get("questions"):
             await interaction.response.send_modal(TicketQuestionModal(button_data))
+            await self.reset(interaction, settings)
             return
 
         await interaction.response.defer(ephemeral=True)
+        await self.reset(interaction, settings)
         await create_ticket(interaction, button_data, [])
+
+    async def reset(self, interaction, settings):
+        if interaction.message is None:
+            return
+        fresh = DropdownPanelView(
+            interaction.guild.id,
+            settings.get("buttons", []),
+            settings.get("panel", {}).get("placeholder"),
+        )
+        try:
+            await interaction.message.edit(view=fresh)
+        except discord.HTTPException:
+            pass
 
 
 class DropdownPanelView(discord.ui.View):
