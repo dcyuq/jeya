@@ -423,6 +423,7 @@ def is_staff(member, settings):
     if member.guild_permissions.administrator:
         return True
     allowed = set(staff_role_ids(settings))
+    allowed.discard(member.guild.id)
     return any(r.id in allowed for r in member.roles)
 
 def find_button(settings, key):
@@ -1177,15 +1178,14 @@ class TicketControls(discord.ui.ActionRow):
             )
             return
 
-        staff = is_staff(interaction.user, settings)
-        if not staff and interaction.user.id != data["opener_id"]:
+        if not is_staff(interaction.user, settings):
             await interaction.response.send_message(
-                embed=embeds.error("only staff or the ticket opener can close this."), ephemeral=True
+                embed=embeds.error("only staff can close tickets."), ephemeral=True
             )
             return
 
         await interaction.response.send_modal(
-            CloseReasonModal(data, interaction.channel, staff)
+            CloseReasonModal(data, interaction.channel, True)
         )
 
 class TicketControlView(discord.ui.LayoutView):
@@ -1554,7 +1554,9 @@ class SettingsView(discord.ui.View):
     )
     async def pick_roles(self, interaction, select):
         await interaction.response.defer()
-        self.builder.settings["staff_role_ids"] = [r.id for r in select.values]
+        self.builder.settings["staff_role_ids"] = [
+            r.id for r in select.values if not r.is_default() and not r.managed
+        ]
         save_config()
         await self.builder.refresh()
 
