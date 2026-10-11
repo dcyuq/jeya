@@ -28,6 +28,11 @@ DEFAULT_CONFIRM_FORMAT = (
 )
 DEFAULT_FOOTER = "kindly make sure all information is complete and correct before proceeding."
 DEFAULT_CONFIRM_BUTTON = "yes, proceed"
+DEFAULT_RECEIVED = (
+    "**confirmation received**\n"
+    "\n"
+    "kindly choose your payment option and remain patient for the owner to respond."
+)
 DEFAULT_TERMS_FORMAT = (
     "**terms and conditions**\n"
     "\n"
@@ -114,6 +119,7 @@ def defaults():
         "confirm_format": DEFAULT_CONFIRM_FORMAT,
         "footer": DEFAULT_FOOTER,
         "confirm_button": DEFAULT_CONFIRM_BUTTON,
+        "received_format": DEFAULT_RECEIVED,
         "terms_enabled": True,
         "terms_format": DEFAULT_TERMS_FORMAT,
         "terms_button": DEFAULT_TERMS_BUTTON,
@@ -215,15 +221,11 @@ def apply_label(button, raw, guild, fallback):
         button.emoji = emoji
 
 
-def get_default_payment_method(settings):
-    methods = settings.get("payment_methods") or []
-    if methods:
-        return methods[0]
-    return {
-        "id": "gcash",
-        "label": DEFAULT_GCASH_BUTTON,
-        "text": DEFAULT_GCASH_TEXT,
-    }
+def find_method(settings, method_id):
+    for method in settings.get("payment_methods") or []:
+        if method.get("id") == method_id:
+            return method
+    return None
 
 
 def save_records():
@@ -241,15 +243,26 @@ def remember(message, order, author_id):
         "confirmed_at": None,
         "agreed_at": None,
         "terms_message_id": None,
+        "payment_message_id": None,
+        "payment_method": None,
     }
     save_records()
 
 
-def lookup(message_id):
+def resolve(message_id):
     record = records.get(message_id)
     if record and "ref" in record:
-        return records.get(record["ref"])
-    return record
+        return record["ref"], records.get(record["ref"])
+    return message_id, record
+
+
+def link_to(record_key, message_id):
+    record = records[record_key]
+    records[message_id] = {"ref": record_key, "channel_id": record["channel_id"]}
+
+
+def jump(interaction, message_id):
+    return f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}/{message_id}"
 
 
 def forget_channel(channel_id):
@@ -276,26 +289,32 @@ async def check_owner(interaction, record):
     return True
 
 
-async def show_payment(interaction, settings, record):
-    view = PaymentMethodView(
-        settings=settings,
-        order=record["order"],
-        author_id=record["author_id"],
-        guild=interaction.guild,
-        method=get_default_payment_method(settings),
+async def point_to(interaction, text, message_id):
+    await interaction.response.send_message(
+        embed=embeds.notice(f"{text} {jump(interaction, message_id)}"),
+        ephemeral=True,
     )
+
+
+async def post_public(interaction, view):
     await interaction.response.send_message(
         view=view,
-        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-async def post_note(channel, text):
     try:
-        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        return await interaction.original_response()
     except discord.HTTPException:
-        pass
+        return None
+
+
+async def post_payment_options(interaction, key, record, note):
+    settings = settings_for(interaction.guild.id)
+    view = PaymentView(settings, record["order"], record["author_id"], interaction.guild, note)
+    sent = await post_public(interaction, view)
+    if sent is not None:
+        record["payment_message_id"] = sent.id
+        link_to(key, sent.id)
+    save_records()
 
 
 class ConfirmRow(discord.ui.ActionRow):
@@ -339,56 +358,34 @@ class ConfirmView(discord.ui.LayoutView):
         self.add_item(box)
 
     async def confirm(self, interaction):
-        record = lookup(interaction.message.id)
+        key, record = resolve(interaction.message.id)
         if not await check_owner(interaction, record):
             return
 
         settings = settings_for(interaction.guild.id)
 
-        if record.get("agreed_at"):
-            await show_payment(interaction, settings, record)
-            return
-
-        if not settings.get("terms_enabled", True):
-            now = int(time.time())
-            record["confirmed_at"] = now
-            record["agreed_at"] = now
-            save_records()
-            await show_payment(interaction, settings, record)
-            await post_note(
-                interaction.channel,
-                f"-# <@{record['author_id']}> confirmed this order <t:{now}:f>",
-            )
+        if record.get("payment_message_id"):
+            await point_to(interaction, "your payment options are here:", record["payment_message_id"])
             return
 
         if record.get("terms_message_id"):
-            link = f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}/{record['terms_message_id']}"
-            await interaction.response.send_message(
-                embed=embeds.notice(f"the terms are already up. agree to them here: {link}"),
-                ephemeral=True,
-            )
+            await point_to(interaction, "the terms are already up. agree to them here:", record["terms_message_id"])
             return
 
-        view = TermsView(
-            settings=settings,
-            order=record["order"],
-            author_id=record["author_id"],
-            guild=interaction.guild,
-        )
-        await interaction.response.send_message(
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        now = int(time.time())
+        record["confirmed_at"] = now
 
-        try:
-            sent = await interaction.original_response()
-        except discord.HTTPException:
-            sent = None
+        if not settings.get("terms_enabled", True):
+            record["agreed_at"] = now
+            note = f"-# <@{record['author_id']}> confirmed this order <t:{now}:f>"
+            await post_payment_options(interaction, key, record, note)
+            return
 
-        record["confirmed_at"] = int(time.time())
+        view = TermsView(settings, record["order"], record["author_id"], interaction.guild)
+        sent = await post_public(interaction, view)
         if sent is not None:
             record["terms_message_id"] = sent.id
-            records[sent.id] = {"ref": interaction.message.id, "channel_id": interaction.channel.id}
+            link_to(key, sent.id)
         save_records()
 
 
@@ -431,24 +428,91 @@ class TermsView(discord.ui.LayoutView):
         self.add_item(box)
 
     async def agree(self, interaction):
-        record = lookup(interaction.message.id)
+        key, record = resolve(interaction.message.id)
+        if not await check_owner(interaction, record):
+            return
+
+        if record.get("payment_message_id"):
+            await point_to(interaction, "your payment options are here:", record["payment_message_id"])
+            return
+
+        record["agreed_at"] = int(time.time())
+        note = f"-# <@{record['author_id']}> agreed to the terms <t:{record['agreed_at']}:f>"
+        await post_payment_options(interaction, key, record, note)
+
+
+class PayButton(discord.ui.DynamicItem[discord.ui.Button], template=r"confirm:pay:(?P<method>[A-Za-z0-9_-]+)"):
+    def __init__(self, method_id, label=None, guild=None):
+        button = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"confirm:pay:{method_id}"[:100],
+        )
+        apply_label(button, label, guild, method_id)
+        super().__init__(button)
+        self.method_id = method_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["method"])
+
+    async def callback(self, interaction):
+        key, record = resolve(interaction.message.id)
         if not await check_owner(interaction, record):
             return
 
         settings = settings_for(interaction.guild.id)
-        first_time = not record.get("agreed_at")
-
-        if first_time:
-            record["agreed_at"] = int(time.time())
-            save_records()
-
-        await show_payment(interaction, settings, record)
-
-        if first_time:
-            await post_note(
-                interaction.channel,
-                f"-# <@{record['author_id']}> agreed to the terms <t:{record['agreed_at']}:f>",
+        method = find_method(settings, self.method_id)
+        if method is None:
+            await interaction.response.send_message(
+                embed=embeds.error("that payment option was removed. pick another one."),
+                ephemeral=True,
             )
+            return
+
+        record["payment_method"] = method.get("label")
+        save_records()
+
+        view = PaymentMethodView(settings, record["order"], record["author_id"], interaction.guild, method)
+        await post_public(interaction, view)
+
+
+class PaymentView(discord.ui.LayoutView):
+    def __init__(self, settings, order, author_id, guild, note=None):
+        super().__init__(timeout=None)
+        self.settings = settings
+        self.order = order
+        self.author_id = author_id
+        self.guild = guild
+        self.note = note
+        self.build()
+
+    def build(self):
+        self.clear_items()
+
+        box = discord.ui.Container()
+        box.add_item(discord.ui.TextDisplay(
+            render(
+                self.settings.get("received_format") or DEFAULT_RECEIVED,
+                self.order,
+                self.author_id,
+                self.guild,
+            )[:4000]
+        ))
+        box.add_item(discord.ui.Separator())
+
+        methods = (self.settings.get("payment_methods") or [])[:25]
+        if not methods:
+            box.add_item(discord.ui.TextDisplay("no payment methods have been configured."))
+        for index in range(0, len(methods), 5):
+            row = discord.ui.ActionRow()
+            for method in methods[index:index + 5]:
+                row.add_item(PayButton(method.get("id", "payment"), method.get("label"), self.guild))
+            box.add_item(row)
+
+        self.add_item(box)
+
+        if self.note:
+            self.add_item(discord.ui.TextDisplay(self.note[:1000]))
 
 
 class PaymentMethodView(discord.ui.LayoutView):
@@ -831,6 +895,10 @@ class SetupView(discord.ui.View):
     async def confirm_button(self, interaction, button):
         await self.edit(interaction, "confirm_button", "confirm button label", limit=LABEL_LIMIT)
 
+    @discord.ui.button(label="received format", style=discord.ButtonStyle.secondary, row=1)
+    async def received_format(self, interaction, button):
+        await self.edit(interaction, "received_format", "confirmation received", multiline=True)
+
     @discord.ui.button(label="terms on/off", style=discord.ButtonStyle.secondary, row=2)
     async def terms_toggle(self, interaction, button):
         self.settings["terms_enabled"] = not self.settings.get("terms_enabled", True)
@@ -862,6 +930,7 @@ class Confirmation(commands.Cog):
     async def cog_load(self):
         self.bot.add_view(ConfirmView(defaults(), {}, None, None))
         self.bot.add_view(TermsView(defaults(), {}, None, None))
+        self.bot.add_dynamic_items(PayButton)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel):
