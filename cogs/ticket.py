@@ -14,6 +14,7 @@ import embeds
 from prefixes import display_prefix
 import emojiutils
 from storage import Store, IntKeyStore
+from . import confirmation
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +121,31 @@ DEFAULT_BUTTON = {
     "channel_name": None,
     "welcome": "Describe your issue and someone will be with you shortly.",
     "questions": [],
+    "confirmation_mode": False,
 }
+
+ORDER_PRESET_QUESTIONS = [
+    {"label": "Item", "placeholder": "e.g. Nitro Gift", "required": True},
+    {"label": "Price", "placeholder": "e.g. $9.99", "required": True},
+    {"label": "Quantity", "placeholder": "e.g. 1", "required": True},
+    {"label": "Notes", "placeholder": "e.g. Special instructions", "required": False},
+    {"label": "Code", "placeholder": "e.g. DISCOUNT10", "required": False},
+]
+
+def apply_order_preset(button_data):
+    button_data["confirmation_mode"] = True
+    button_data["questions"] = [dict(q) for q in ORDER_PRESET_QUESTIONS]
+    return button_data
+
+def confirmation_order(answers):
+    order = {}
+    for label, answer in answers:
+        key = (label or "").strip().lower()
+        if key:
+            value = (answer or "").strip()
+            order[key] = value
+            order[re.sub(r"\s+", "_", key)] = value
+    return order
 
 CUSTOM_TOKEN = re.compile(r"<(a?):([A-Za-z0-9_~]{2,32}):(\d{15,25})>")
 
@@ -579,20 +604,41 @@ async def create_ticket(interaction, button_data, answers):
     }
     save_tickets()
 
-    welcome = button_data.get("welcome") or DEFAULT_BUTTON["welcome"]
-    parts = [f"**Ticket {number:04d} - {button_text(button_data)}**", "", welcome]
-    for question, answer in answers:
-        parts.append("")
-        parts.append(f"**{question[:256]}**")
-        parts.append((answer or "-")[:1024])
-    body = "\n".join(parts)
-
     mentions = " ".join(r.mention for r in roles)
     ping = f"{interaction.user.mention} {mentions}".strip()
-    await channel.send(
-        view=TicketControlView(ping, body),
-        allowed_mentions=discord.AllowedMentions(users=True, roles=roles or False),
-    )
+
+    if button_data.get("confirmation_mode"):
+        await channel.send(
+            content=ping,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=roles or False),
+        )
+
+        order = confirmation_order(answers)
+        opening = confirmation.ConfirmView(
+            settings=confirmation.settings_for(guild.id),
+            order=order,
+            author_id=interaction.user.id,
+            guild=guild,
+        )
+        opening.add_item(TicketControls())
+        sent = await channel.send(
+            view=opening,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False),
+        )
+        confirmation.remember(sent, order, interaction.user.id)
+    else:
+        welcome = button_data.get("welcome") or DEFAULT_BUTTON["welcome"]
+        parts = [f"**Ticket {number:04d} - {button_text(button_data)}**", "", welcome]
+        for question, answer in answers:
+            parts.append("")
+            parts.append(f"**{question[:256]}**")
+            parts.append((answer or "-")[:1024])
+        body = "\n".join(parts)
+
+        await channel.send(
+            view=TicketControlView(ping, body),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=roles or False),
+        )
 
     await interaction.followup.send(
         embed=embeds.notice(f"ticket created: {channel.mention}"),
@@ -933,11 +979,18 @@ class TicketQuestionModal(discord.ui.Modal):
         self.button_data = button_data
         self.inputs = []
 
+        order_mode = button_data.get("confirmation_mode")
+
         for question in button_data["questions"][:MAX_QUESTIONS]:
+            required = question.get("required", True)
+            if order_mode and question["label"].strip().lower() in {"notes", "code"}:
+                required = False
+
             field = discord.ui.TextInput(
                 label=question["label"][:45],
-                style=discord.TextStyle.paragraph,
-                required=True,
+                placeholder=question.get("placeholder"),
+                style=discord.TextStyle.short if order_mode else discord.TextStyle.paragraph,
+                required=required,
                 max_length=1000,
             )
             self.inputs.append((question["label"], field))
@@ -1367,11 +1420,17 @@ class QuestionsModal(discord.ui.Modal, title="Ticket Questions"):
     async def on_submit(self, interaction):
         await interaction.response.defer()
 
+        existing = {
+            q["label"].strip().lower(): q
+            for q in self.button_data.get("questions", [])
+        }
         questions = []
         for field in self.fields:
             text = field.value.strip()
             if text:
-                questions.append({"label": text})
+                kept = dict(existing.get(text.lower(), {}))
+                kept["label"] = text
+                questions.append(kept)
 
         self.button_data["questions"] = questions
         save_config()
@@ -1586,7 +1645,13 @@ class ButtonManageView(discord.ui.View):
 
     def summary(self):
         count = len(self.button_data.get("questions", []))
-        if count:
+        if self.button_data.get("confirmation_mode"):
+            mode = "Order button, opens with the confirmation form"
+            listed = "\n".join(
+                f"{i + 1}. {q['label']}"
+                for i, q in enumerate(self.button_data["questions"])
+            ) or "No questions set."
+        elif count:
             mode = f"Asks {count} question(s) before opening"
             listed = "\n".join(
                 f"{i + 1}. {q['label']}"
@@ -1613,6 +1678,21 @@ class ButtonManageView(discord.ui.View):
             ),
         )
 
+    @discord.ui.button(label="Make Order Button", style=discord.ButtonStyle.secondary, row=2)
+    async def make_order_button(self, interaction, button):
+        if self.button_data.get("confirmation_mode"):
+            await interaction.response.send_message(
+                embed=embeds.notice("this is already an Order button. use Set Questions to tweak it."),
+                ephemeral=True,
+            )
+            return
+
+        apply_order_preset(self.button_data)
+        save_config()
+        refreshed = ButtonManageView(self.builder, self.button_data)
+        await interaction.response.edit_message(embed=refreshed.summary(), view=refreshed)
+        await self.builder.refresh()
+
     @discord.ui.button(label="Edit Details", style=discord.ButtonStyle.secondary, row=2)
     async def edit_details(self, interaction, button):
         await interaction.response.send_modal(
@@ -1629,6 +1709,7 @@ class ButtonManageView(discord.ui.View):
     async def clear_questions(self, interaction, button):
         await interaction.response.defer()
         self.button_data["questions"] = []
+        self.button_data["confirmation_mode"] = False
         save_config()
         await self.builder.refresh()
         await interaction.followup.send(
@@ -1657,7 +1738,9 @@ class ButtonPickSelect(discord.ui.Select):
                 value=b["key"],
                 emoji=icon_partial(b.get("emoji")),
                 description=(
-                    f"{len(b.get('questions', []))} question(s)"
+                    "Order button"
+                    if b.get("confirmation_mode")
+                    else f"{len(b.get('questions', []))} question(s)"
                     if b.get("questions")
                     else "Opens instantly"
                 ),
@@ -1754,7 +1837,10 @@ class BuilderView(discord.ui.View):
             lines.append("**Buttons**")
             for entry in settings["buttons"]:
                 count = len(entry.get("questions", []))
-                mode = f"asks {count}" if count else "instant"
+                if entry.get("confirmation_mode"):
+                    mode = "order"
+                else:
+                    mode = f"asks {count}" if count else "instant"
                 colour = style_label(entry.get("style"))
                 icon = entry.get("emoji")
                 label = entry.get("label")
