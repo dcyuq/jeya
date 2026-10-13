@@ -14,7 +14,7 @@ class Send(commands.Cog):
         message_type="Type of message to send",
         content="What you want the bot to send (use \\n for new lines)",
         channel="Where to send it",
-        color="Hex color for embed or container, e.g. #ffc0cb",
+        color="Hex color for embed, e.g. #ffc0cb",
     )
     @app_commands.choices(message_type=[
         app_commands.Choice(name="raw text", value="raw"),
@@ -43,7 +43,7 @@ class Send(commands.Cog):
             await target.send(embed=discord.Embed(description=text, color=accent))
         else:
             view = discord.ui.LayoutView()
-            view.add_item(discord.ui.Container(discord.ui.TextDisplay(text), accent_colour=accent))
+            view.add_item(discord.ui.Container(discord.ui.TextDisplay(text)))
             await target.send(view=view)
 
         await interaction.response.send_message(f"Sent in {target.mention}", ephemeral=True)
