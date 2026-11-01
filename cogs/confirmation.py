@@ -844,6 +844,7 @@ class SetupView(discord.ui.View):
         lines = [
             "**confirmation setup**",
             "",
+            f"**ping** : {(settings.get('ping') or 'off')[:200]}",
             f"**confirm button** : {settings['confirm_button']}",
             f"**terms and conditions** : {'on' if settings.get('terms_enabled', True) else 'off'}",
             f"**terms button** : {settings['terms_button']}",
